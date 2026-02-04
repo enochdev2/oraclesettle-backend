@@ -1,0 +1,3 @@
+# OracleSettle Backend
+
+A Rust-based settlement engine for prediction markets that collects multi-source oracle data, applies deterministic consensus, and anchors results on-chain.

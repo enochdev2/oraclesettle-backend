@@ -4,6 +4,7 @@ use axum::{
     Json,
     extract::State,
 };
+use sha2::{Sha256, Digest};
 use axum::extract::Path;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,14 @@ use std::net::SocketAddr;
 use tracing_subscriber;
 use uuid::Uuid;
 use chrono::Utc;
+use crate::proof::{hash_leaf, build_merkle_root};
+use crate::eth::submit::submit_settlement;
+
+
+
+mod proof;
+mod eth;
+
 
 #[derive(Clone)]
 struct AppState {
@@ -44,6 +53,7 @@ struct CreateReportRequest {
 }
 
 
+
 #[derive(Deserialize)]
 struct CreateMarketRequest {
     question: String,
@@ -56,6 +66,15 @@ struct Settlement {
     market_id: String,
     outcome: f64,
     decided_at: String,
+}
+
+#[derive(Serialize)]
+struct SettlementView {
+    market_id: String,
+    outcome: f64,
+    decided_at: String,
+    reports: Vec<Report>,
+    hash: String,
 }
 
 
@@ -83,11 +102,19 @@ async fn main() {
         resolver_loop(resolver_state).await;
     });
 
+    let batch_state = state.clone();
+
+    tokio::spawn(async move {
+        batcher_loop(batch_state).await;
+    });
+
+
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/markets", post(create_market).get(list_markets))
         .route("/markets/:id/reports", post(create_report).get(list_reports))
+        .route("/markets/:id/settlement", get(get_settlement),)
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
@@ -256,14 +283,17 @@ async fn list_reports(
 
 
 async fn resolver_loop(state: AppState) {
+    
     loop {
-        resolve_markets(&state).await;
+    auto_close_markets(&state).await;
+    resolve_markets(&state).await;
 
-        tokio::time::sleep(
-            std::time::Duration::from_secs(10),
-        )
-        .await;
-    }
+    tokio::time::sleep(
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+}
+
 }
 
 
@@ -272,7 +302,7 @@ async fn resolve_markets(state: &AppState) {
     let markets = sqlx::query!(
         r#"
         SELECT id, closes_at FROM markets
-        WHERE status = 'OPEN'
+        WHERE status = 'CLOSED'
         LIMIT 10
         "#
     )
@@ -345,7 +375,7 @@ async fn finalize_market(
         r#"
         UPDATE markets
         SET status = 'RESOLVED'
-        WHERE id = ? AND status = 'OPEN'
+        WHERE id = ? AND status = 'CLOSED'
         "#,
     )
     .bind(market_id)
@@ -355,6 +385,40 @@ async fn finalize_market(
 
     tx.commit().await.unwrap();
 
+    // use sha2::{Sha256, Digest};
+
+    let mut hasher = Sha256::new();
+    hasher.update(market_id.as_bytes());
+    let market_hash: [u8; 32] = hasher.finalize().into();
+
+    // Temporary root (single leaf for now)
+    let data = format!("{}:{}:{}", market_id, outcome, now);
+    let leaf = hash_leaf(&data);
+
+    // Convert outcome
+    let outcome_u64 = outcome as u64;
+
+    // Convert timestamp
+    let ts = chrono::DateTime::parse_from_rfc3339(&now)
+        .unwrap()
+        .timestamp() as u64;
+
+    // Send to chain (fire and log)
+    match submit_settlement(
+        market_hash,
+        leaf,
+        outcome_u64,
+        ts,
+    ).await {
+        Ok(_) => {
+            tracing::info!("Settlement submitted on-chain");
+        }
+        Err(e) => {
+            tracing::error!("Chain submit failed: {:?}", e);
+        }
+    }
+
+
     tracing::info!(
         "Market {} resolved: {}",
         market_id,
@@ -362,26 +426,199 @@ async fn finalize_market(
     );
 }
 
+async fn get_settlement(
+    State(state): State<AppState>,
+    Path(market_id): Path<String>,
+) -> Result<Json<SettlementView>, axum::http::StatusCode> {
+    let settlement = sqlx::query!(
+        r#"
+        SELECT outcome, decided_at
+        FROM settlements
+        WHERE market_id = ?
+        "#,
+        market_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .unwrap();
 
+    let settlement = match settlement {
+        Some(s) => s,
+        None => return Err(axum::http::StatusCode::NOT_FOUND),
+    };
 
+    let reports = sqlx::query!(
+        r#"
+        SELECT id, market_id, source, value, created_at
+        FROM reports
+        WHERE market_id = ?
+        ORDER BY created_at ASC
+        "#,
+        market_id
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
 
+    let reports: Vec<Report> = reports
+        .into_iter()
+        .map(|r| Report {
+            id: r.id.unwrap_or_default(),
+            market_id: r.market_id,
+            source: r.source,
+            value: r.value,
+            created_at: r.created_at,
+        })
+        .collect();
 
+    let hash = settlement_hash(
+        &market_id,
+        settlement.outcome,
+        &settlement.decided_at,
+        &reports,
+    );
 
+    Ok(Json(SettlementView {
+        market_id,
+        outcome: settlement.outcome,
+        decided_at: settlement.decided_at,
+        reports,
+        hash,
+    }))
+}
 
+fn settlement_hash(
+    market_id: &str,
+    outcome: f64,
+    decided_at: &str,
+    reports: &[Report],
+) -> String {
+    let mut hasher = Sha256::new();
 
+    hasher.update(market_id.as_bytes());
+    hasher.update(outcome.to_string());
+    hasher.update(decided_at.as_bytes());
 
+    for r in reports {
+        hasher.update(r.id.as_bytes());
+        hasher.update(r.source.as_bytes());
+        hasher.update(r.value.to_string());
+        hasher.update(r.created_at.as_bytes());
+    }
 
+    hex::encode(hasher.finalize())
+}
 
+async fn collect_unbatched_settlements(
+    state: &AppState,
+) -> Vec<(String, String)> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT market_id, decided_at
+        FROM settlements
+        WHERE market_id NOT IN (
+            SELECT market_id FROM batches
+        )
+        "#
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
 
+    rows.into_iter()
+        .map(|r| (r.market_id, r.decided_at))
+        .collect()
+}
 
+async fn batcher_loop(state: AppState) {
+    loop {
+        create_batch(&state).await;
 
+        tokio::time::sleep(
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+    }
+}
 
+async fn create_batch(state: &AppState) {
+    let rows = sqlx::query!(
+        r#"
+        SELECT s.market_id, s.outcome, s.decided_at
+        FROM settlements s
+        LEFT JOIN batch_items b
+          ON s.market_id = b.market_id
+        WHERE b.market_id IS NULL
+        "#
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
 
+    if rows.is_empty() {
+        return;
+    }
 
+    let mut leaves = Vec::new();
 
+    for r in &rows {
+        let data = format!(
+            "{}:{}:{}",
+            r.market_id,
+            r.outcome,
+            r.decided_at
+        );
 
+        let hash = hash_leaf(&data);
+        leaves.push(hash);
+    }
 
+    let root = build_merkle_root(leaves);
 
+    let batch_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+
+    let root_hex = hex::encode(root);
+
+    let mut tx = state.db.begin().await.unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO batches
+        (id, merkle_root, created_at)
+        VALUES (?, ?, ?)
+        "#,
+    )
+    .bind(&batch_id)
+    .bind(&root_hex)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    for r in rows {
+        sqlx::query(
+            r#"
+            INSERT INTO batch_items
+            (batch_id, market_id)
+            VALUES (?, ?)
+            "#,
+        )
+        .bind(&batch_id)
+        .bind(&r.market_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+
+    tx.commit().await.unwrap();
+
+    tracing::info!(
+        "Created batch {} root={}",
+        batch_id,
+        root_hex
+    );
+}
 
 fn try_resolve(values: &[f64]) -> Option<f64> {
     if values.len() < 3 {
@@ -401,6 +638,30 @@ fn try_resolve(values: &[f64]) -> Option<f64> {
         Some(avg)
     } else {
         None
+    }
+}
+
+async fn auto_close_markets(state: &AppState) {
+    let now = Utc::now().to_rfc3339();
+
+    let res = sqlx::query!(
+        r#"
+        UPDATE markets
+        SET status = 'CLOSED'
+        WHERE status = 'OPEN'
+        AND closes_at <= ?
+        "#,
+        now
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    if res.rows_affected() > 0 {
+        tracing::info!(
+            "Auto-closed {} markets",
+            res.rows_affected()
+        );
     }
 }
 

@@ -6,6 +6,8 @@ use axum::{
 };
 use sha2::{Sha256, Digest};
 use axum::extract::Path;
+use tower_http::cors::{CorsLayer, Any};
+
 
 use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
@@ -14,10 +16,12 @@ use tracing_subscriber;
 use uuid::Uuid;
 use chrono::Utc;
 use crate::proof::{hash_leaf, build_merkle_root};
-use crate::eth::submit::submit_settlement;
+// use crate::eth::submit::submit_settlement;
+use crate::models::outbox::SettlementPayload; 
 
 
-
+mod models;
+mod worker;
 mod proof;
 mod eth;
 
@@ -108,14 +112,27 @@ async fn main() {
         batcher_loop(batch_state).await;
     });
 
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        worker::run_worker(worker_state).await;
+    });
+
+
 
 
     let app = Router::new()
-        .route("/health", get(health))
-        .route("/markets", post(create_market).get(list_markets))
-        .route("/markets/:id/reports", post(create_report).get(list_reports))
-        .route("/markets/:id/settlement", get(get_settlement),)
-        .with_state(state);
+    .route("/health", get(health))
+    .route("/markets", post(create_market).get(list_markets))
+    .route("/markets/:id/reports", post(create_report).get(list_reports))
+    .route("/markets/:id/settlement", get(get_settlement))
+    .layer(
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+    .with_state(state);
+
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
 
@@ -351,10 +368,43 @@ async fn finalize_market(
     market_id: &str,
     outcome: f64,
 ) {
-    let id = Uuid::new_v4().to_string();
+    let settlement_id = Uuid::new_v4().to_string();
+    // let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
 
+     // use sha2::{Sha256, Digest};
+
+    let mut hasher = Sha256::new();
+    hasher.update(market_id.as_bytes());
+    let market_hash: [u8; 32] = hasher.finalize().into();
+
+    // Temporary root (single leaf for now)
+    let data = format!("{}:{}:{}", market_id, outcome, now);
+    let leaf = hash_leaf(&data);
+
+    // Convert outcome
+    let outcome_u64 = outcome as u64;
+
+    // Convert timestamp
+    let ts = chrono::DateTime::parse_from_rfc3339(&now)
+        .unwrap()
+        .timestamp() as u64;
+
+    let payload = SettlementPayload {
+        market_id: market_id.to_string(),
+        market_hash_hex: hex::encode(market_hash),
+        leaf_hex: hex::encode(leaf),
+        outcome_u64,
+        ts,
+    };
+
+    let payload_json = serde_json::to_string(&payload).unwrap();
+
+
     let mut tx = state.db.begin().await.unwrap();
+
+
+    
 
     sqlx::query(
         r#"
@@ -363,7 +413,7 @@ async fn finalize_market(
         VALUES (?, ?, ?, ?)
         "#,
     )
-    .bind(&id)
+    .bind(&settlement_id)
     .bind(market_id)
     .bind(outcome)
     .bind(&now)
@@ -383,40 +433,45 @@ async fn finalize_market(
     .await
     .unwrap();
 
+    let outbox_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO outbox
+        (id, market_id, payload, status, retries, last_error, created_at, updated_at)
+        VALUES (?, ?, ?, 'PENDING', 0, NULL, ?, ?)
+        "#,
+    )
+    .bind(&outbox_id)
+    .bind(market_id)
+    .bind(&payload_json)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
     tx.commit().await.unwrap();
 
-    // use sha2::{Sha256, Digest};
+   
 
-    let mut hasher = Sha256::new();
-    hasher.update(market_id.as_bytes());
-    let market_hash: [u8; 32] = hasher.finalize().into();
-
-    // Temporary root (single leaf for now)
-    let data = format!("{}:{}:{}", market_id, outcome, now);
-    let leaf = hash_leaf(&data);
-
-    // Convert outcome
-    let outcome_u64 = outcome as u64;
-
-    // Convert timestamp
-    let ts = chrono::DateTime::parse_from_rfc3339(&now)
-        .unwrap()
-        .timestamp() as u64;
+    
 
     // Send to chain (fire and log)
-    match submit_settlement(
-        market_hash,
-        leaf,
-        outcome_u64,
-        ts,
-    ).await {
-        Ok(_) => {
-            tracing::info!("Settlement submitted on-chain");
-        }
-        Err(e) => {
-            tracing::error!("Chain submit failed: {:?}", e);
-        }
-    }
+    // match submit_settlement(
+    //     market_hash,
+    //     leaf,
+    //     outcome_u64,
+    //     ts,
+    // ).await {
+    //     Ok(_) => {
+    //         tracing::info!("Settlement submitted on-chain");
+    //     }
+    //     Err(e) => {
+    //         tracing::error!("Chain submit failed: {:?}", e);
+    //     }
+    // }
+
+    tracing::info!("Queued settlement in outbox id={}", outbox_id);
 
 
     tracing::info!(
@@ -667,10 +722,3 @@ async fn auto_close_markets(state: &AppState) {
 
 
 
-// let listener = tokio::net::TcpListener::bind(&addr)
-//     .await
-//     .unwrap();
-
-// axum::serve(listener, app)
-//     .await
-//     .unwrap();

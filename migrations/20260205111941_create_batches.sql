@@ -1,16 +1,11 @@
--- Add migration script here
-CREATE TABLE batches (
-    id TEXT PRIMARY KEY,
-    merkle_root TEXT NOT NULL,
-    created_at TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS batches (
+  id UUID PRIMARY KEY,
+  merkle_root TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE batch_items (
-    batch_id TEXT NOT NULL,
-    market_id TEXT NOT NULL,
-
-    PRIMARY KEY(batch_id, market_id),
-
-    FOREIGN KEY(batch_id) REFERENCES batches(id),
-    FOREIGN KEY(market_id) REFERENCES settlements(market_id)
+CREATE TABLE IF NOT EXISTS batch_items (
+  batch_id UUID NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+  market_id UUID NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
+  PRIMARY KEY (batch_id, market_id)
 );

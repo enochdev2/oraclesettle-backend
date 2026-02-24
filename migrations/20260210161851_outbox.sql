@@ -1,25 +1,13 @@
--- Add migration script here
-CREATE TABLE outbox (
+CREATE TABLE IF NOT EXISTS outbox (
   id UUID PRIMARY KEY,
-  market_id UUID NOT NULL,
+  market_id UUID NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
   payload JSONB NOT NULL,
-  status TEXT NOT NULL, -- PENDING | SENT | FAILED
-  retries INT DEFAULT 0,
+  status TEXT NOT NULL,
+  retries INT NOT NULL DEFAULT 0,
   last_error TEXT,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- CREATE TABLE IF NOT EXISTS outbox (
---   id TEXT PRIMARY KEY,
---   market_id TEXT NOT NULL,
---   payload TEXT NOT NULL,              -- JSON as TEXT in SQLite
---   status TEXT NOT NULL,               -- PENDING | SENT | FAILED
---   retries INTEGER NOT NULL DEFAULT 0,
---   last_error TEXT,
---   created_at TEXT NOT NULL,
---   updated_at TEXT NOT NULL
--- );
-
--- CREATE INDEX IF NOT EXISTS outbox_status_idx
--- ON outbox(status);
+CREATE INDEX IF NOT EXISTS idx_outbox_status_created
+  ON outbox (status, created_at);

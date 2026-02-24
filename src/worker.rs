@@ -1,8 +1,9 @@
 use crate::AppState;
 use crate::eth::submit::submit_settlement;
 use crate::models::outbox::SettlementPayload;
-use sqlx::Row;
 
+use sqlx::Row;
+use uuid::Uuid;
 
 pub async fn run_worker(state: AppState) {
     loop {
@@ -20,24 +21,24 @@ pub async fn run_worker(state: AppState) {
         .unwrap();
 
         for row in rows {
-            let job_id: String = row.get("id");
-            let payload_str: String = row.get("payload");
-            let retries: i64 = row.get("retries"); // SQLite integer -> i64
+            let job_id: Uuid = row.get("id");
+            let payload_json: serde_json::Value = row.get("payload");
+            let retries: i32 = row.get("retries");
 
-            let payload: SettlementPayload = match serde_json::from_str(&payload_str) {
+            let payload: SettlementPayload = match serde_json::from_value(payload_json) {
                 Ok(p) => p,
                 Err(e) => {
                     sqlx::query(
                         r#"
                         UPDATE outbox
-                        SET status='FAILED',
-                            last_error=?,
-                            updated_at=DATETIME('now')
-                        WHERE id=?
+                        SET status = 'FAILED',
+                            last_error = $1,
+                            updated_at = now()
+                        WHERE id = $2
                         "#
                     )
                     .bind(format!("bad payload json: {}", e))
-                    .bind(&job_id)
+                    .bind(job_id)
                     .execute(&state.db)
                     .await
                     .unwrap();
@@ -51,14 +52,14 @@ pub async fn run_worker(state: AppState) {
                     sqlx::query(
                         r#"
                         UPDATE outbox
-                        SET status='FAILED',
-                            last_error=?,
-                            updated_at=DATETIME('now')
-                        WHERE id=?
+                        SET status = 'FAILED',
+                            last_error = $1,
+                            updated_at = now()
+                        WHERE id = $2
                         "#
                     )
                     .bind(format!("bad market_hash hex: {}", e))
-                    .bind(&job_id)
+                    .bind(job_id)
                     .execute(&state.db)
                     .await
                     .unwrap();
@@ -72,14 +73,14 @@ pub async fn run_worker(state: AppState) {
                     sqlx::query(
                         r#"
                         UPDATE outbox
-                        SET status='FAILED',
-                            last_error=?,
-                            updated_at=DATETIME('now')
-                        WHERE id=?
+                        SET status = 'FAILED',
+                            last_error = $1,
+                            updated_at = now()
+                        WHERE id = $2
                         "#
                     )
                     .bind(format!("bad leaf hex: {}", e))
-                    .bind(&job_id)
+                    .bind(job_id)
                     .execute(&state.db)
                     .await
                     .unwrap();
@@ -91,14 +92,14 @@ pub async fn run_worker(state: AppState) {
                 sqlx::query(
                     r#"
                     UPDATE outbox
-                    SET status='FAILED',
-                        last_error=?,
-                        updated_at=DATETIME('now')
-                    WHERE id=?
+                    SET status = 'FAILED',
+                        last_error = $1,
+                        updated_at = now()
+                    WHERE id = $2
                     "#
                 )
                 .bind("hash/leaf wrong length (expected 32 bytes)")
-                .bind(&job_id)
+                .bind(job_id)
                 .execute(&state.db)
                 .await
                 .unwrap();
@@ -116,13 +117,13 @@ pub async fn run_worker(state: AppState) {
                     sqlx::query(
                         r#"
                         UPDATE outbox
-                        SET status='SENT',
-                            updated_at=DATETIME('now'),
-                            last_error=NULL
-                        WHERE id=?
+                        SET status = 'SENT',
+                            updated_at = now(),
+                            last_error = NULL
+                        WHERE id = $1
                         "#
                     )
-                    .bind(&job_id)
+                    .bind(job_id)
                     .execute(&state.db)
                     .await
                     .unwrap();
@@ -134,17 +135,17 @@ pub async fn run_worker(state: AppState) {
                     sqlx::query(
                         r#"
                         UPDATE outbox
-                        SET retries=?,
-                            last_error=?,
-                            status=?,
-                            updated_at=DATETIME('now')
-                        WHERE id=?
+                        SET retries = $1,
+                            last_error = $2,
+                            status = $3,
+                            updated_at = now()
+                        WHERE id = $4
                         "#
                     )
                     .bind(next_retries)
                     .bind(e.to_string())
                     .bind(next_status)
-                    .bind(&job_id)
+                    .bind(job_id)
                     .execute(&state.db)
                     .await
                     .unwrap();

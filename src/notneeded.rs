@@ -1,23 +1,30 @@
 use axum::{
-    extract::{Path, State},
     routing::{get, post},
-    Json, Router,
+    Router,
+    Json,
+    extract::State,
 };
-use chrono::{DateTime, Utc};
+use sha2::{Sha256, Digest};
+use axum::extract::Path;
+use tower_http::cors::{CorsLayer, Any};
+
+
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::net::SocketAddr;
-use tower_http::cors::{Any, CorsLayer};
+use tracing_subscriber;
 use uuid::Uuid;
+use chrono::{DateTime, Utc};
+use crate::proof::{hash_leaf, build_merkle_root};
+// use crate::eth::submit::submit_settlement;
+use crate::models::outbox::SettlementPayload; 
 
-use crate::models::outbox::SettlementPayload;
-use crate::proof::{build_merkle_root, hash_leaf};
 
-mod eth;
 mod models;
-mod proof;
 mod worker;
+mod proof;
+mod eth;
+
 
 #[derive(Clone)]
 struct AppState {
@@ -33,7 +40,7 @@ struct Market {
     created_at: DateTime<Utc>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize)]
 struct Report {
     id: Uuid,
     market_id: Uuid,
@@ -49,11 +56,23 @@ struct CreateReportRequest {
     idempotency_key: String,
 }
 
+
+
 #[derive(Deserialize)]
 struct CreateMarketRequest {
     question: String,
-    // RFC3339 string from client
+    // accept RFC3339 string from client, parse into DateTime<Utc>
     closes_at: String,
+}
+
+
+
+#[derive(Serialize)]
+struct Settlement {
+    id: String,
+    market_id: String,
+    outcome: f64,
+    decided_at: String,
 }
 
 #[derive(Serialize)]
@@ -65,49 +84,70 @@ struct SettlementView {
     hash: String,
 }
 
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    // Load env
     dotenvy::dotenv().ok();
 
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let db_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&db_url)
-        .await
-        .expect("Failed to connect DB");
+    .max_connections(10)
+    .connect(&db_url)
+    .await
+    .expect("Failed to connect DB");
 
     let state = AppState { db: pool };
-
+    
     let resolver_state = state.clone();
-    tokio::spawn(async move { resolver_loop(resolver_state).await });
+
+    tokio::spawn(async move {
+        resolver_loop(resolver_state).await;
+    });
 
     let batch_state = state.clone();
-    tokio::spawn(async move { batcher_loop(batch_state).await });
+
+    tokio::spawn(async move {
+        batcher_loop(batch_state).await;
+    });
 
     let worker_state = state.clone();
-    tokio::spawn(async move { worker::run_worker(worker_state).await });
+    tokio::spawn(async move {
+        worker::run_worker(worker_state).await;
+    });
+
+
+
 
     let app = Router::new()
-        .route("/health", get(health))
-        .route("/markets", post(create_market).get(list_markets))
-        .route("/markets/:id/reports", post(create_report).get(list_reports))
-        .route("/markets/:id/settlement", get(get_settlement))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .with_state(state);
+    .route("/health", get(health))
+    .route("/markets", post(create_market).get(list_markets))
+    .route("/markets/:id/reports", post(create_report).get(list_reports))
+    .route("/markets/:id/settlement", get(get_settlement))
+    .layer(
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+    .with_state(state);
 
-    // let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+
     tracing::info!("Server running on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap();
+
+    axum::serve(listener, app)
+        .await
+        .unwrap();
 }
 
 async fn health() -> &'static str {
@@ -124,6 +164,7 @@ async fn create_market(
     let closes_at = chrono::DateTime::parse_from_rfc3339(&payload.closes_at)
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?
         .with_timezone(&Utc);
+    
 
     sqlx::query(
         r#"
@@ -142,6 +183,7 @@ async fn create_market(
 
     Ok("Market created")
 }
+
 
 async fn list_markets(State(state): State<AppState>) -> Json<Vec<Market>> {
     let rows = sqlx::query!(
@@ -167,7 +209,8 @@ async fn list_markets(State(state): State<AppState>) -> Json<Vec<Market>> {
         .collect();
 
     Json(markets)
-}
+  }
+
 
 async fn create_report(
     State(state): State<AppState>,
@@ -177,16 +220,16 @@ async fn create_report(
     let id = Uuid::new_v4();
     let now = Utc::now();
 
-    let market = sqlx::query!("SELECT status FROM markets WHERE id = $1", market_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Market not found".to_string()))?;
+    let market = sqlx::query!(
+        "SELECT status FROM markets WHERE id = $1",
+        market_id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Market not found".to_string()))?;
 
     if market.status != "OPEN" {
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            "Market is closed".to_string(),
-        ));
+        return Err((axum::http::StatusCode::BAD_REQUEST, "Market is closed".to_string()));
     }
 
     let result = sqlx::query(
@@ -207,13 +250,10 @@ async fn create_report(
     match result {
         Ok(_) => Ok("Report submitted"),
         Err(e) => {
-            // Postgres unique violation SQLSTATE: 23505
+            // better pg unique detection: check SQLSTATE 23505
             if let Some(db_err) = e.as_database_error() {
                 if db_err.code().as_deref() == Some("23505") {
-                    return Err((
-                        axum::http::StatusCode::CONFLICT,
-                        "Duplicate report or idempotency key".to_string(),
-                    ));
+                    return Err((axum::http::StatusCode::CONFLICT, "Duplicate report or idempotency key".to_string()));
                 }
             }
             Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -221,7 +261,10 @@ async fn create_report(
     }
 }
 
-async fn list_reports(State(state): State<AppState>, Path(market_id): Path<Uuid>) -> Json<Vec<Report>> {
+async fn list_reports(
+    State(state): State<AppState>,
+    Path(market_id): Path<Uuid>,
+) -> Json<Vec<Report>> {
     let rows = sqlx::query!(
         r#"
         SELECT id, market_id, source, value, created_at
@@ -250,13 +293,19 @@ async fn list_reports(State(state): State<AppState>, Path(market_id): Path<Uuid>
 }
 
 async fn resolver_loop(state: AppState) {
+    
     loop {
-        auto_close_markets(&state).await;
-        resolve_markets(&state).await;
+    auto_close_markets(&state).await;
+    resolve_markets(&state).await;
 
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-    }
+    tokio::time::sleep(
+        std::time::Duration::from_secs(10),
+    )
+    .await;
 }
+
+}
+
 
 async fn resolve_markets(state: &AppState) {
     let markets = sqlx::query!(
@@ -278,10 +327,13 @@ async fn resolve_markets(state: &AppState) {
             continue;
         }
 
-        let reports = sqlx::query!(r#"SELECT value FROM reports WHERE market_id = $1"#, market.id)
-            .fetch_all(&state.db)
-            .await
-            .unwrap();
+        let reports = sqlx::query!(
+            r#"SELECT value FROM reports WHERE market_id = $1"#,
+            market.id
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
 
         let values: Vec<f64> = reports.into_iter().map(|r| r.value).collect();
 
@@ -290,6 +342,7 @@ async fn resolve_markets(state: &AppState) {
         }
     }
 }
+
 
 async fn finalize_market(state: &AppState, market_id: Uuid, outcome: f64) {
     let settlement_id = Uuid::new_v4();
@@ -407,7 +460,21 @@ async fn get_settlement(
         })
         .collect();
 
-    let hash = settlement_hash(market_id, settlement.outcome, settlement.decided_at, &reports);
+    let hash = settlement_hash(
+        &market_id.to_string(),
+        settlement.outcome,
+        &settlement.decided_at.to_rfc3339(),
+        &reports
+            .iter()
+            .map(|r| Report {
+                id: r.id,
+                market_id: r.market_id,
+                source: r.source.clone(),
+                value: r.value,
+                created_at: r.created_at.to_rfc3339(),
+            })
+            .collect::<Vec<_>>(),
+    );
 
     Ok(Json(SettlementView {
         market_id,
@@ -418,35 +485,38 @@ async fn get_settlement(
     }))
 }
 
+
 fn settlement_hash(
-    market_id: Uuid,
+    market_id: &str,
     outcome: f64,
-    decided_at: DateTime<Utc>,
+    decided_at: &str,
     reports: &[Report],
 ) -> String {
     let mut hasher = Sha256::new();
 
     hasher.update(market_id.as_bytes());
-    hasher.update(outcome.to_string().as_bytes());
-    hasher.update(decided_at.to_rfc3339().as_bytes());
+    hasher.update(outcome.to_string());
+    hasher.update(decided_at.as_bytes());
 
     for r in reports {
         hasher.update(r.id.as_bytes());
         hasher.update(r.source.as_bytes());
-        hasher.update(r.value.to_string().as_bytes());
-        hasher.update(r.created_at.to_rfc3339().as_bytes());
+        hasher.update(r.value.to_string());
+        hasher.update(r.created_at.as_bytes());
     }
 
     hex::encode(hasher.finalize())
 }
 
-async fn collect_unbatched_settlements(state: &AppState) -> Vec<(Uuid, DateTime<Utc>)> {
+async fn collect_unbatched_settlements(
+    state: &AppState,
+) -> Vec<(String, String)> {
     let rows = sqlx::query!(
         r#"
         SELECT market_id, decided_at
         FROM settlements
         WHERE market_id NOT IN (
-            SELECT market_id FROM batch_items
+            SELECT market_id FROM batches
         )
         "#
     )
@@ -454,13 +524,19 @@ async fn collect_unbatched_settlements(state: &AppState) -> Vec<(Uuid, DateTime<
     .await
     .unwrap();
 
-    rows.into_iter().map(|r| (r.market_id, r.decided_at)).collect()
+    rows.into_iter()
+        .map(|r| (r.market_id, r.decided_at))
+        .collect()
 }
 
 async fn batcher_loop(state: AppState) {
     loop {
         create_batch(&state).await;
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+        tokio::time::sleep(
+            std::time::Duration::from_secs(30),
+        )
+        .await;
     }
 }
 
@@ -483,28 +559,38 @@ async fn create_batch(state: &AppState) {
     }
 
     let mut leaves = Vec::new();
+
     for r in &rows {
-        let data = format!("{}:{}:{}", r.market_id, r.outcome, r.decided_at.to_rfc3339());
-        leaves.push(hash_leaf(&data));
+        let data = format!(
+            "{}:{}:{}",
+            r.market_id,
+            r.outcome,
+            r.decided_at
+        );
+
+        let hash = hash_leaf(&data);
+        leaves.push(hash);
     }
 
     let root = build_merkle_root(leaves);
-    let root_hex = hex::encode(root);
 
     let batch_id = Uuid::new_v4();
     let now = Utc::now();
+
+    let root_hex = hex::encode(root);
 
     let mut tx = state.db.begin().await.unwrap();
 
     sqlx::query(
         r#"
-        INSERT INTO batches (id, merkle_root, created_at)
+        INSERT INTO batches
+        (id, merkle_root, created_at)
         VALUES ($1, $2, $3)
         "#,
     )
-    .bind(batch_id)
+    .bind(&batch_id)
     .bind(&root_hex)
-    .bind(now)
+    .bind(&now)
     .execute(&mut *tx)
     .await
     .unwrap();
@@ -512,12 +598,13 @@ async fn create_batch(state: &AppState) {
     for r in rows {
         sqlx::query(
             r#"
-            INSERT INTO batch_items (batch_id, market_id)
+            INSERT INTO batch_items
+            (batch_id, market_id)
             VALUES ($1, $2)
             "#,
         )
-        .bind(batch_id)
-        .bind(r.market_id)
+        .bind(&batch_id)
+        .bind(&r.market_id)
         .execute(&mut *tx)
         .await
         .unwrap();
@@ -525,7 +612,11 @@ async fn create_batch(state: &AppState) {
 
     tx.commit().await.unwrap();
 
-    tracing::info!("Created batch {} root={}", batch_id, root_hex);
+    tracing::info!(
+        "Created batch {} root={}",
+        batch_id,
+        root_hex
+    );
 }
 
 fn try_resolve(values: &[f64]) -> Option<f64> {
@@ -538,6 +629,7 @@ fn try_resolve(values: &[f64]) -> Option<f64> {
 
     let min = sorted[0];
     let max = sorted[sorted.len() - 1];
+
     let diff = (max - min) / min;
 
     if diff <= 0.01 {
@@ -556,7 +648,7 @@ async fn auto_close_markets(state: &AppState) {
         UPDATE markets
         SET status = 'CLOSED'
         WHERE status = 'OPEN'
-          AND closes_at <= $1
+        AND closes_at <= $1
         "#,
         now
     )
@@ -565,6 +657,12 @@ async fn auto_close_markets(state: &AppState) {
     .unwrap();
 
     if res.rows_affected() > 0 {
-        tracing::info!("Auto-closed {} markets", res.rows_affected());
+        tracing::info!(
+            "Auto-closed {} markets",
+            res.rows_affected()
+        );
     }
 }
+
+
+

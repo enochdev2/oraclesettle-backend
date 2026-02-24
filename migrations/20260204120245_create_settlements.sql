@@ -1,9 +1,6 @@
--- Add migration script here
-CREATE TABLE settlements (
-    id TEXT PRIMARY KEY,
-    market_id TEXT NOT NULL UNIQUE,
-    outcome REAL NOT NULL,
-    decided_at TEXT NOT NULL,
-
-    FOREIGN KEY(market_id) REFERENCES markets(id)
+CREATE TABLE IF NOT EXISTS settlements (
+  id UUID PRIMARY KEY,
+  market_id UUID NOT NULL UNIQUE REFERENCES markets(id) ON DELETE CASCADE,
+  outcome DOUBLE PRECISION NOT NULL,
+  decided_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

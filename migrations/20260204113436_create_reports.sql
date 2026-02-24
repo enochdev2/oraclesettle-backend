@@ -1,14 +1,13 @@
--- Add migration script here
-CREATE TABLE reports (
-    id TEXT PRIMARY KEY,
-    market_id TEXT NOT NULL,
-    source TEXT NOT NULL,
-    value REAL NOT NULL,
-    idempotency_key TEXT NOT NULL,
-    created_at TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS reports (
+  id UUID PRIMARY KEY,
+  market_id UUID NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
+  source TEXT NOT NULL,
+  value DOUBLE PRECISION NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    UNIQUE(market_id, source),
-    UNIQUE(idempotency_key),
-
-    FOREIGN KEY(market_id) REFERENCES markets(id)
+  UNIQUE (market_id, idempotency_key)
 );
+
+CREATE INDEX IF NOT EXISTS idx_reports_market_created
+  ON reports (market_id, created_at);
